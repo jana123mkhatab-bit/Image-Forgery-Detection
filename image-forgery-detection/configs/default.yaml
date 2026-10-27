@@ -1,0 +1,28 @@
+# Dataset ids are Hugging Face Hub ids streamed with streaming=True (no disk use).
+# VERIFY each id on huggingface.co before a long run; swap them here if needed.
+data:
+  crop: 256
+  p_ai: 0.25          # fraction of samples taken from the AI-generated stream
+  p_authentic: 0.25   # fraction left untouched (the rest are spliced/copy-moved)
+  real:
+    id: "FILL_ME_real_photo_dataset"   # a large real-photo dataset with an "image" column
+    split: train
+    image_key: image
+  ai:
+    id: "FILL_ME_ai_generated_dataset" # AI-generated images (e.g. a GenImage/CIFAKE-style set)
+    split: train
+    image_key: image
+
+model:
+  encoder: resnet34
+  weights: imagenet
+  use_srm: true
+
+train:
+  batch: 16          # fits 8 GB at 256x256 with mixed precision
+  accum: 2           # effective batch 32
+  lr: 0.0003
+  workers: 2         # keep low on Windows; raise on Colab
+  max_steps: 20000
+  save_every: 500
+  out_dir: runs/baseline_r34_srm   # on Colab pass --out_dir /content/drive/MyDrive/forgery/runs/...

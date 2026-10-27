@@ -1,0 +1,18 @@
+# install the CUDA build of torch/torchvision first from https://pytorch.org
+segmentation-models-pytorch
+timm
+datasets
+opencv-python-headless
+scikit-learn
+pillow
+numpy
+pandas
+matplotlib
+tqdm
+pyyaml
+gradio
+tensorboard
+open_clip_torch
+diffusers
+transformers
+accelerate
