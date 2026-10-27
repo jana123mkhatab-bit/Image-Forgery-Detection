@@ -128,7 +128,12 @@ def main():
         if step % accum == 0:
             scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
         if step % 50 == 0:
-            print(f"step {step} loss {loss.item() * accum:.4f} ({time.time() - t0:.0f}s)")
+            try:
+                import psutil
+                ram = f" ram {psutil.virtual_memory().percent:.0f}%"
+            except Exception:
+                ram = ""
+            print(f"step {step} loss {loss.item() * accum:.4f} ({time.time() - t0:.0f}s){ram}", flush=True)
         if step % t["save_every"] == 0:
             torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step}, ck)
         if use_val and step % t["val_every"] == 0:

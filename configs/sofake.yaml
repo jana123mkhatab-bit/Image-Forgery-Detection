@@ -13,7 +13,7 @@ data:
     image_col: image
     label_col: label
     mask_col: mask
-    buffer: 1000
+    buffer: 128           # small on purpose: each buffered record is a full-size image (RAM was exhausted at 1000)
     jpeg_frac: 0.15       # keep ~15% JPEG in every class (the dataset has 71% real vs ~8% fake)
 
 model:
