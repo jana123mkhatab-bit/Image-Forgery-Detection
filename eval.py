@@ -9,6 +9,10 @@
 
   # 3) try any image(s): verdict + heatmap overlay
   python eval.py predict --ckpt baseline_final.pt --image photo.jpg
+
+  # 4) real-world test set streamed from the Hugging Face Hub (no download, no manual setup)
+  python eval.py hub --ckpt baseline_final.pt --preset sofake     # real / tampered / fully AI
+  python eval.py hub --ckpt baseline_final.pt --preset khang      # real vs AI-edited, with masks
 """
 import argparse
 import json
@@ -228,6 +232,118 @@ def run_folder(a, cfg, model, dev, out):
     return res
 
 
+# ----------------------------------------------------------------------- hub
+# Test sets that load straight from the Hugging Face Hub. Column layouts were read off the
+# dataset pages, not verified by running them, so run_hub prints the real columns and fails
+# loudly if the label column is missing. Override with --hf-id / --label-col / --mask-col.
+HUB_PRESETS = {
+    "sofake": dict(id="saberzl/So-Fake-OOD", split="test_image"),   # REAL / TAMPERED / FULL_SYNTHETIC
+    "khang": dict(id="KhangTruong/Merged", split="cross_test"),     # real / fake (AI-edited), with masks
+}
+
+
+def norm_label(v, names=None):
+    """Map a dataset label to our classes: 0 authentic, 1 edited, 2 fully AI-generated (None = unknown)."""
+    if isinstance(v, (int, np.integer)):
+        if names:
+            v = names[int(v)]
+        else:
+            return int(v) if int(v) in (0, 1, 2) else None
+    s = str(v).upper()
+    if "SYNTH" in s:
+        return 2
+    if "TAMPER" in s or "FAKE" in s or "EDIT" in s:
+        return 1
+    if "REAL" in s or "AUTHENTIC" in s:
+        return 0
+    return None
+
+
+def run_hub(a, cfg, model, dev, out):
+    from datasets import load_dataset
+    spec = dict(HUB_PRESETS.get(a.preset, {}))
+    spec["id"] = a.hf_id or spec.get("id")
+    spec["split"] = a.hf_split or spec.get("split", "test")
+    if not spec["id"]:
+        raise SystemExit("hub mode needs --preset or --hf-id")
+    ds = load_dataset(spec["id"], split=spec["split"], streaming=True,
+                      **({"name": a.hf_config} if a.hf_config else {}))
+    feats = getattr(ds, "features", None)
+    names = getattr(feats.get(a.label_col), "names", None) if feats else None
+    it = iter(ds.shuffle(seed=a.seed, buffer_size=500))
+    counts, scanned, skipped = {0: 0, 1: 0, 2: 0}, 0, {"unknown_label": 0, "too_large": 0, "no_mask": 0}
+    conf = np.zeros((3, 3), int)
+    ms = MaskStats()
+    y_bin, s_any, s_max, s_area = [], [], [], []
+    fp_area = {0: [], 2: []}
+    saved = {0: 0, 1: 0, 2: 0}
+    for rec in it:
+        scanned += 1
+        if scanned == 1:
+            print("columns:", list(rec.keys()))
+            for col in (a.image_col, a.label_col):
+                if col not in rec:
+                    raise SystemExit(f"column '{col}' not found; use --image-col / --label-col with one of {list(rec.keys())}")
+        if sum(counts.values()) >= a.n or scanned > a.max_scan:
+            break
+        cls = norm_label(rec[a.label_col], names)
+        if cls is None:
+            skipped["unknown_label"] += 1
+            continue
+        if counts[cls] >= a.per_class:
+            continue
+        im = rec[a.image_col]
+        img = np.array(im.convert("RGB"))
+        if max(img.shape[:2]) > MAX_SIDE:
+            skipped["too_large"] += 1
+            continue
+        gt = None
+        if cls == 1:
+            m = rec.get(a.mask_col)
+            if m is None:
+                skipped["no_mask"] += 1
+            else:
+                m = np.array(m.convert("L"))
+                gt = cv2.resize(m, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST) > 127
+                if not gt.any():
+                    gt = None
+                    skipped["no_mask"] += 1
+        mask, probs = infer(model, img, dev)
+        counts[cls] += 1
+        conf[cls, int(probs.argmax())] += 1
+        y_bin.append(int(cls != 0))
+        s_any.append(float(1 - probs[0]))
+        s_max.append(float(mask.max()))
+        s_area.append(float((mask >= 0.5).mean()))
+        if gt is not None:
+            ms.add(mask, gt)
+        if cls in fp_area:
+            fp_area[cls].append(s_area[-1])
+        if saved[cls] < a.overlays:
+            cv2.imwrite(str(out / f"hub_{CLASSES[cls]}_{saved[cls]}.png"),
+                        overlay(img, mask, probs, None if gt is None else gt.astype(np.uint8)))
+            saved[cls] += 1
+        if sum(counts.values()) % 50 == 0:
+            print(f"{sum(counts.values())}/{a.n}  (scanned {scanned})")
+    res = {"mode": f"hub: {spec['id']} [{spec['split']}] (never seen in training)",
+           "samples_per_class": {CLASSES[k]: v for k, v in counts.items()}, "scanned": scanned,
+           "skipped": skipped, "label_names_from_dataset": names,
+           "confusion_rows_true_cols_pred": conf.tolist(), "class_order": CLASSES}
+    if all(counts.values()):
+        res["classification_f1"] = cls_report(conf)
+        res["accuracy"] = float(np.trace(conf) / conf.sum())
+    res["flagged_as_not_authentic_by_true_class"] = {
+        CLASSES[k]: float(1 - conf[k, 0] / conf[k].sum()) for k in range(3) if conf[k].sum()}
+    res["real_vs_not_real"] = binary_report(
+        y_bin, {"class_head_1-p_authentic": s_any, "mask_max_prob": s_max, "mask_area_frac": s_area},
+        fixed=("class_head_1-p_authentic",))
+    res["mask_on_edited"] = ms.summary()
+    res["false_positive_area_on_authentic"] = float(np.mean(fp_area[0])) if fp_area[0] else None
+    if counts[1] and not ms.f1[0.5]:
+        res["note"] = "edited samples had no usable mask column, so pixel F1/IoU could not be computed"
+    return res
+
+
 # ------------------------------------------------------------------- predict
 def run_predict(a, cfg, model, dev, out):
     paths = list_images(a.image, 0) if Path(a.image).is_dir() else [Path(a.image)]
@@ -248,7 +364,7 @@ def run_predict(a, cfg, model, dev, out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["synthetic", "folder", "predict"])
+    ap.add_argument("mode", choices=["synthetic", "folder", "predict", "hub"])
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--out", default="results/eval")
@@ -261,6 +377,15 @@ def main():
     ap.add_argument("--image", help="predict: an image file or a folder")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--overlays", type=int, default=12, help="how many example images to save")
+    ap.add_argument("--preset", choices=sorted(HUB_PRESETS), help="hub: a ready-made Hugging Face test set")
+    ap.add_argument("--hf-id", help="hub: any dataset id, instead of a preset")
+    ap.add_argument("--hf-split")
+    ap.add_argument("--hf-config")
+    ap.add_argument("--image-col", default="image")
+    ap.add_argument("--mask-col", default="mask")
+    ap.add_argument("--label-col", default="label")
+    ap.add_argument("--per-class", type=int, default=200, help="hub: max samples per class")
+    ap.add_argument("--max-scan", type=int, default=6000, help="hub: stop after looking at this many records")
     a = ap.parse_args()
 
     cfg = yaml.safe_load(open(a.config))
@@ -272,7 +397,8 @@ def main():
         ap.error("folder mode needs --images and --masks")
     if a.mode == "predict" and not a.image:
         ap.error("predict mode needs --image")
-    res = {"synthetic": run_synthetic, "folder": run_folder, "predict": run_predict}[a.mode](a, cfg, model, dev, out)
+    res = {"synthetic": run_synthetic, "folder": run_folder, "predict": run_predict,
+           "hub": run_hub}[a.mode](a, cfg, model, dev, out)
     (out / f"{a.mode}_results.json").write_text(json.dumps(res, indent=2))
     print(json.dumps(res, indent=2))
     print("saved to", out)
