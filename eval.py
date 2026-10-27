@@ -13,6 +13,8 @@
   # 4) real-world test set streamed from the Hugging Face Hub (no download, no manual setup)
   python eval.py hub --ckpt baseline_final.pt --preset sofake     # real / tampered / fully AI
   python eval.py hub --ckpt baseline_final.pt --preset khang      # real vs AI-edited, with masks
+
+  # add --tile to any mode to score 256x256 tiles (the training scale) instead of the whole image
 """
 import argparse
 import json
@@ -53,6 +55,44 @@ def infer(model, img_rgb, dev):
     mask = torch.sigmoid(ml.float())[0, 0, :h, :w].cpu().numpy()
     probs = torch.softmax(cl.float(), 1)[0].cpu().numpy()
     return mask, probs
+
+
+@torch.no_grad()
+def infer_tiled(model, img_rgb, dev, tile=256, stride=192, chunk=16):
+    """Diagnostic: run the model on overlapping tile x tile windows (the scale it was trained at)
+    and stitch. Mask = mean of overlapping tile probabilities. Class probs = max over tiles of
+    P(edited)/P(ai) with authentic = the remainder, i.e. the most suspicious tile decides."""
+    h, w = img_rgb.shape[:2]
+    if h < tile or w < tile:
+        return infer_full(model, img_rgb, dev)
+    ys = list(range(0, h - tile + 1, stride))
+    xs = list(range(0, w - tile + 1, stride))
+    if ys[-1] != h - tile:
+        ys.append(h - tile)
+    if xs[-1] != w - tile:
+        xs.append(w - tile)
+    pos = [(y, x) for y in ys for x in xs]
+    acc, cnt = np.zeros((h, w), np.float32), np.zeros((h, w), np.float32)
+    cls = []
+    for i in range(0, len(pos), chunk):
+        part = pos[i:i + chunk]
+        x = torch.stack([torch.from_numpy(img_rgb[y:y + tile, xx:xx + tile]).permute(2, 0, 1).float() / 255
+                         for y, xx in part])
+        with torch.autocast(dev, dtype=torch.float16, enabled=dev == "cuda"):
+            ml, cl = model(x.to(dev))
+        pm = torch.sigmoid(ml.float())[:, 0].cpu().numpy()
+        cls.append(torch.softmax(cl.float(), 1).cpu().numpy())
+        for (y, xx), m in zip(part, pm):
+            acc[y:y + tile, xx:xx + tile] += m
+            cnt[y:y + tile, xx:xx + tile] += 1
+    cls = np.concatenate(cls)
+    p_edit, p_ai = float(cls[:, 1].max()), float(cls[:, 2].max())
+    probs = np.array([max(1 - p_edit - p_ai, 0.0), p_edit, p_ai], dtype=np.float32)
+    probs /= probs.sum()
+    return acc / np.maximum(cnt, 1), probs
+
+
+infer_full = infer  # whole-image inference; --tile swaps `infer` for infer_tiled
 
 
 def overlay(img_rgb, mask, probs, gt=None):
@@ -384,6 +424,8 @@ def main():
     ap.add_argument("--image-col", default="image")
     ap.add_argument("--mask-col", default="mask")
     ap.add_argument("--label-col", default="label")
+    ap.add_argument("--tile", action="store_true",
+                    help="diagnostic: run on 256x256 tiles (training scale) instead of the whole image")
     ap.add_argument("--per-class", type=int, default=200, help="hub: max samples per class")
     ap.add_argument("--max-scan", type=int, default=6000, help="hub: stop after looking at this many records")
     a = ap.parse_args()
@@ -393,6 +435,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(a.ckpt, cfg, dev)
+    if a.tile:
+        globals()["infer"] = infer_tiled
     if a.mode == "folder" and not (a.images and a.masks):
         ap.error("folder mode needs --images and --masks")
     if a.mode == "predict" and not a.image:
