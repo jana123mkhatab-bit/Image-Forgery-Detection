@@ -1,0 +1,32 @@
+# Train on So-Fake-Set (Hugging Face, streamed, no download). Test later on So-Fake-OOD (unseen).
+data:
+  source: sofake
+  crop: 256
+  min_edit_px: 256
+  synthetic_frac: 0.15      # share of real images that get our own splice/copy-move (classical edits)
+  sofake:
+    id: saberzl/So-Fake-Set
+    split: train
+    val_split: validation
+    class_mix: [0.34, 0.33, 0.33]   # authentic / edited / AI
+    image_col: image
+    label_col: label
+    mask_col: mask
+    buffer: 1000
+
+model:
+  encoder: resnet34
+  weights: imagenet
+  use_srm: true
+
+train:
+  batch: 16
+  accum: 2
+  lr: 0.0003
+  cosine: true          # lr decays to 5% of lr by max_steps
+  workers: 2
+  max_steps: 10000
+  save_every: 500
+  val_every: 1000       # evaluate on a fixed held-out set; best checkpoint -> best.pt
+  val_n: 450
+  out_dir: runs/sofake_r34_srm
