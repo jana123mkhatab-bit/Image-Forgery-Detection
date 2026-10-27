@@ -9,10 +9,10 @@ Dataset ids live in configs/default.yaml. VERIFY each id on huggingface.co
 before a long run (names and availability change).
 """
 import io
+from pathlib import Path
 
 import numpy as np
 import torch
-from datasets import load_dataset
 from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -25,7 +25,23 @@ def _to_rgb(x):
     return np.array(x.convert("RGB"))
 
 
+def _local_stream(spec, seed):
+    """Endless shuffled iterator over image files in a folder (e.g. COCO val2017
+    downloaded to Colab's temporary disk). Yields {image_key: PIL.Image}."""
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    files = sorted(p for p in Path(spec["local_dir"]).rglob("*") if p.suffix.lower() in exts)
+    if not files:
+        raise FileNotFoundError(f"no images found under {spec['local_dir']}")
+    key, rng = spec.get("image_key", "image"), np.random.default_rng(seed)
+    while True:
+        for i in rng.permutation(len(files)):
+            yield {key: Image.open(files[i])}
+
+
 def _stream(spec, seed):
+    if spec.get("local_dir"):
+        return _local_stream(spec, seed)
+    from datasets import load_dataset  # only needed for Hub streaming
     ds = load_dataset(spec["id"], split=spec.get("split", "train"), streaming=True,
                       **({"name": spec["config"]} if spec.get("config") else {}))
     return iter(ds.shuffle(seed=seed, buffer_size=spec.get("buffer", 500)))

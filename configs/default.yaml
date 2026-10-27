@@ -5,11 +5,13 @@ data:
   p_ai: 0.25          # fraction of samples taken from the AI-generated stream
   p_authentic: 0.25   # fraction left untouched (the rest are spliced/copy-moved)
   real:
-    id: "FILL_ME_real_photo_dataset"   # a large real-photo dataset with an "image" column
-    split: train
+    # Original-resolution COCO val2017 JPEGs, downloaded by the Colab notebook to
+    # Colab's temporary disk (never to your laptop). For Hub streaming instead,
+    # remove local_dir and set id/split/image_key.
+    local_dir: /content/coco/val2017
     image_key: image
   ai:
-    id: "FILL_ME_ai_generated_dataset" # AI-generated images (e.g. a GenImage/CIFAKE-style set)
+    id: "bitmind/GenImage_glide"   # GLIDE-generated images, single "image" column, 256x256
     split: train
     image_key: image
 
