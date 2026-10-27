@@ -117,7 +117,7 @@ def main():
         if t.get("cosine"):
             frac = min(step / t["max_steps"], 1.0)
             for g in opt.param_groups:
-                g["lr"] = t["lr"] * (0.05 + 0.95 * 0.5 * (1 + np.cos(np.pi * frac)))
+                g["lr"] = float(t["lr"] * (0.05 + 0.95 * 0.5 * (1 + np.cos(np.pi * frac))))  # plain float: numpy scalars break torch.load on resume
         x, m, y = x.to(dev), m.to(dev), y.to(dev)
         with torch.autocast(dev, dtype=torch.float16, enabled=dev == "cuda"):
             ml, cl = model(x)

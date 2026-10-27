@@ -15,7 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from sofake_stream import to_class
+from sofake_stream import decode_image, open_stream, to_class
 
 NAMES = ["authentic", "edited", "ai_generated"]
 
@@ -40,8 +40,8 @@ def main():
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    from datasets import load_dataset
-    ds = load_dataset(a.id, split=a.split, streaming=True).shuffle(seed=a.seed, buffer_size=1000)
+    ds = open_stream({"id": a.id}, a.split, a.seed)
+    bad = 0
     st = defaultdict(lambda: defaultdict(list))
     gens, labels, fmts = defaultdict(Counter), Counter(), defaultdict(Counter)
     sheet = defaultdict(list)
@@ -55,7 +55,12 @@ def main():
         c = to_class(raw)
         if c is None:
             continue
-        im = rec["image"]
+        try:
+            im = decode_image(rec["image"])
+            m = decode_image(rec.get("mask"))
+        except (OSError, ValueError, SyntaxError):
+            bad += 1
+            continue
         fmts[c][im.format or "decoded"] += 1
         w, h = im.size
         st[c]["w"].append(w); st[c]["h"].append(h); st[c]["mp"].append(w * h / 1e6)
@@ -64,7 +69,6 @@ def main():
             st[c]["jpeg_q"].append(q)
         if rec.get("generator"):
             gens[c][str(rec["generator"])] += 1
-        m = rec.get("mask")
         if c == 1:
             if m is None:
                 st[c]["no_mask"].append(1)
@@ -87,7 +91,7 @@ def main():
             cv2.putText(tile, NAMES[c], (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
             sheet[c].append(tile)
 
-    rep = {"raw_label_values": dict(labels), "scanned": min(a.n, sum(labels.values()))}
+    rep = {"raw_label_values": dict(labels), "scanned": min(a.n, sum(labels.values())), "corrupt_images": bad}
     for c in range(3):
         s = st[c]
         if not s["w"]:

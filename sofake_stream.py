@@ -11,6 +11,9 @@ Differences from data_stream.ForgeryStream:
   * optional `synthetic_frac`: some real images get our own splice / copy-move, so classical
     Photoshop-style edits stay represented.
 """
+import io
+import time
+
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -30,10 +33,42 @@ def to_class(v):
 
 
 def open_stream(spec, split, seed):
-    from datasets import load_dataset
+    """Stream with image columns left UNDECODED (raw bytes), so one corrupt image in the dataset
+    cannot crash the loader: we decode ourselves and skip bad records (see decode_image)."""
+    from datasets import Image as HFImage, load_dataset
     ds = load_dataset(spec["id"], split=split, streaming=True,
                       **({"name": spec["config"]} if spec.get("config") else {}))
+    for col in (spec.get("image_col", "image"), spec.get("mask_col", "mask")):
+        if col in (getattr(ds, "features", None) or {}):
+            ds = ds.cast_column(col, HFImage(decode=False))
     return iter(ds.shuffle(seed=seed, buffer_size=spec.get("buffer", 1000)))
+
+
+def robust_stream(spec, split, seed, max_restarts=30):
+    """Like open_stream, but if reading fails (network drop, bad shard) it reopens the stream with a
+    new shuffle seed instead of killing the training run."""
+    attempt = 0
+    while True:
+        try:
+            yield from open_stream(spec, split, seed + 7919 * attempt)
+            return
+        except Exception as e:  # noqa: BLE001 - any read error: log, back off, reopen
+            attempt += 1
+            print(f"[stream] read error ({type(e).__name__}: {str(e)[:120]}); reopening ({attempt}/{max_restarts})")
+            if attempt > max_restarts:
+                raise
+            time.sleep(min(2 * attempt, 30))
+
+
+def decode_image(x):
+    """PIL image from a raw {'bytes','path'} dict (or an already decoded PIL image). Raises on corrupt data."""
+    from PIL import Image
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        x = Image.open(io.BytesIO(x["bytes"])) if x.get("bytes") is not None else Image.open(x["path"])
+    x.load()  # forces full decode so truncated files fail HERE, where we catch them
+    return x
 
 
 class SoFakeStream(IterableDataset):
@@ -56,9 +91,9 @@ class SoFakeStream(IterableDataset):
         min_px = d.get("min_edit_px", 256)
         img_key, lab_key, mask_key = (spec.get("image_col", "image"), spec.get("label_col", "label"),
                                       spec.get("mask_col", "mask"))
-        donor, n_out, first = None, 0, True
+        donor, n_out, first, bad = None, 0, True, 0
         limit = None if self.max_items is None else -(-self.max_items // nw)
-        for rec in open_stream(spec, self.split, self.seed + wid):
+        for rec in robust_stream(spec, self.split, self.seed + wid):
             if first:
                 first = False
                 if wid == 0:
@@ -73,13 +108,19 @@ class SoFakeStream(IterableDataset):
             w = target / (seen / seen.sum())            # how much each class is over/under-represented
             if rng.random() > w[cls] / w.max():
                 continue
-            img = np.array(rec[img_key].convert("RGB"))
+            try:
+                img = np.array(decode_image(rec[img_key]).convert("RGB"))
+                m = decode_image(rec.get(mask_key)) if cls == 1 else None
+            except (OSError, ValueError, SyntaxError, KeyError, TypeError):
+                bad += 1                      # corrupt / truncated image: skip it
+                if bad in (1, 10, 100, 1000):
+                    print(f"[stream] skipped {bad} corrupt records so far")
+                continue
             if max(img.shape[:2]) > 4096:
                 continue
             mask = np.zeros(img.shape[:2], np.uint8)
             label = cls
             if cls == 1:
-                m = rec.get(mask_key)
                 if m is None:
                     continue
                 import cv2
