@@ -3,6 +3,7 @@ data:
   source: sofake
   crop: 256
   min_edit_px: 256
+  degrade: true             # identical random JPEG/blur/noise for all classes (hides format cues)
   synthetic_frac: 0.15      # share of real images that get our own splice/copy-move (classical edits)
   sofake:
     id: saberzl/So-Fake-Set
@@ -13,6 +14,7 @@ data:
     label_col: label
     mask_col: mask
     buffer: 1000
+    jpeg_frac: 0.15       # keep ~15% JPEG in every class (the dataset has 71% real vs ~8% fake)
 
 model:
   encoder: resnet34

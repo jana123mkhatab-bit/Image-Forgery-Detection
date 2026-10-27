@@ -86,12 +86,15 @@ class SoFakeStream(IterableDataset):
         rng = np.random.default_rng(self.seed + wid)
         target = np.array(spec.get("class_mix", [1 / 3, 1 / 3, 1 / 3]), float)
         target /= target.sum()
-        seen = np.ones(3)  # running class frequencies of the raw stream
         syn_frac = d.get("synthetic_frac", 0.0) if self.train else 0.0
         min_px = d.get("min_edit_px", 256)
         img_key, lab_key, mask_key = (spec.get("image_col", "image"), spec.get("label_col", "label"),
                                       spec.get("mask_col", "mask"))
         donor, n_out, first, bad = None, 0, True, 0
+        jpeg_frac = spec.get("jpeg_frac")
+        acc = np.zeros((3, 2))  # accepted [jpeg, non-jpeg] counts per source class
+        self.acc = acc
+        wait, max_wait = 0, 400  # safety: after 400 balance-rejections in a row, accept anyway (never stall)
         limit = None if self.max_items is None else -(-self.max_items // nw)
         for rec in robust_stream(spec, self.split, self.seed + wid):
             if first:
@@ -104,12 +107,16 @@ class SoFakeStream(IterableDataset):
             cls = to_class(rec[lab_key])
             if cls is None:
                 continue
-            seen[cls] += 1
-            w = target / (seen / seen.sum())            # how much each class is over/under-represented
-            if rng.random() > w[cls] / w.max():
+            # class balance on what is actually KEPT (acc also counts the format filter below):
+            # a class that is ahead of its target share waits for the others to catch up
+            kept = acc.sum(1) / target
+            if kept[cls] > kept.min() + 8 and wait < max_wait:
+                wait += 1
                 continue
             try:
-                img = np.array(decode_image(rec[img_key]).convert("RGB"))
+                pil = decode_image(rec[img_key])
+                is_jpeg = int(pil.format == "JPEG")
+                img = np.array(pil.convert("RGB"))
                 m = decode_image(rec.get(mask_key)) if cls == 1 else None
             except (OSError, ValueError, SyntaxError, KeyError, TypeError):
                 bad += 1                      # corrupt / truncated image: skip it
@@ -118,6 +125,18 @@ class SoFakeStream(IterableDataset):
                 continue
             if max(img.shape[:2]) > 4096:
                 continue
+            # FORMAT SHORTCUT GUARD: in this dataset real images are mostly JPEG and fakes mostly PNG,
+            # so "is it a JPEG" would predict the class. Keep the JPEG share of every class near
+            # `jpeg_frac` (drops surplus real JPEGs / fake PNGs); `degrade` below then recompresses
+            # all classes alike.
+            if jpeg_frac is not None:
+                a_j, a_p = acc[cls]
+                if wait < max_wait and (
+                        (is_jpeg and a_j > jpeg_frac / (1 - jpeg_frac) * a_p + 3)
+                        or (not is_jpeg and a_p > (1 - jpeg_frac) / jpeg_frac * a_j + 3)):
+                    wait += 1
+                    continue
+                acc[cls][0 if is_jpeg else 1] += 1
             mask = np.zeros(img.shape[:2], np.uint8)
             label = cls
             if cls == 1:
@@ -137,8 +156,11 @@ class SoFakeStream(IterableDataset):
             if self.train and rng.random() < 0.5:                    # horizontal flip
                 img, mask = img[:, ::-1], mask[:, ::-1]
             img, mask = fs.random_crop(np.ascontiguousarray(img), np.ascontiguousarray(mask), self.size, rng)
+            if d.get("degrade", True):
+                img = fs.degrade(img, rng)    # same random JPEG/blur/noise for every class, after cropping
             if label == 1 and int((mask > 127).sum()) < min_px:
                 continue
+            wait = 0
             x = torch.from_numpy(img.copy()).permute(2, 0, 1).float() / 255
             m = torch.from_numpy((mask > 127).astype(np.float32))[None]
             yield x, m, torch.tensor(label)
