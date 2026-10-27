@@ -82,6 +82,9 @@ class ForgeryStream(IterableDataset):
             donor = _to_rgb(rec[key])
             img = fs.degrade(img, rng)
             img, mask = fs.random_crop(img, mask, self.size, rng)
+            # drop edited samples whose edit is (almost) gone after cropping: a wrong label is worse than no sample
+            if label == 1 and int((mask > 127).sum()) < d.get("min_edit_px", 256):
+                continue
             x = torch.from_numpy(img).permute(2, 0, 1).float() / 255
             m = torch.from_numpy((mask > 127).astype(np.float32))[None]
             yield x, m, torch.tensor(label)

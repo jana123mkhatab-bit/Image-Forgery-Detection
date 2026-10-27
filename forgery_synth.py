@@ -80,5 +80,24 @@ def random_crop(img, mask, size, rng):
         img = np.pad(img, ((0, ph), (0, pw), (0, 0)), mode="reflect")
         mask = np.pad(mask, ((0, ph), (0, pw)), mode="constant")
         h, w = img.shape[:2]
-    y, x = int(rng.integers(0, h - size + 1)), int(rng.integers(0, w - size + 1))
+    ys, xs = np.nonzero(mask > 127)
+    if len(ys) == 0:  # untouched or AI image: plain random crop
+        y, x = int(rng.integers(0, h - size + 1)), int(rng.integers(0, w - size + 1))
+    else:
+        # Tampered image: the crop must keep the edit, otherwise the label says "edited"
+        # while no edited pixel is visible. Try random windows anchored on an edited pixel and take
+        # the first that keeps at least 256 edited pixels (so edit size stays varied); if none
+        # does, keep the best one and let the caller decide.
+        best, y, x = -1, 0, 0
+        for _ in range(8):
+            k = int(rng.integers(0, len(ys)))
+            cy, cx = int(ys[k]), int(xs[k])
+            y0 = int(rng.integers(max(0, cy - size + 1), min(cy, h - size) + 1))
+            x0 = int(rng.integers(max(0, cx - size + 1), min(cx, w - size) + 1))
+            area = int((mask[y0:y0 + size, x0:x0 + size] > 127).sum())
+            if area > best:
+                best, y, x = area, y0, x0
+            if area >= 256:
+                y, x = y0, x0
+                break
     return img[y:y + size, x:x + size], mask[y:y + size, x:x + size]
